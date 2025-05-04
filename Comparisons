@@ -1,0 +1,434 @@
+import os
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from torch.nn import functional as F
+from osgeo import gdal
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import precision_score, recall_score, f1_score
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+
+# My own custom implementation of the TRANSGAN model,
+# developed entirely from scratch to integrate transformer-based
+# attention with generative adversarial growth simulation.
+from interpretation import EnhancedUrbanGAN
+
+
+class RasterProcessor:
+    """
+    Custom raster processing utility class.
+    Developed from first principles to handle reading,
+    masking, and normalization of GeoTIFF arrays.
+    """
+    def __init__(self):
+        # store per-factor normalization stats (min, max)
+        self.stats = {}
+
+    def read_raster(self, path):
+        """
+        Read a single-band raster from disk.
+        Raises FileNotFoundError or IOError on failure.
+        """
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Raster file not found: {path}")
+        ds = gdal.Open(path)
+        if ds is None:
+            raise IOError(f"GDAL could not open: {path}")
+        band = ds.GetRasterBand(1)
+        array = band.ReadAsArray()
+        return ds, array
+
+    def create_valid_mask(self, array, nodata=0):
+        """
+        Return boolean mask of valid (non-nodata) pixels.
+        Assumes 'nodata' value of 0 by default.
+        """
+        return array != nodata
+
+    def normalize(self, array, factor_id, nodata_val=-9999):
+        """
+        Scale array values to [0,1], ignoring nodata_val entries.
+        Applies a log1p transform for factor_id == 1.
+        """
+        arr = array.astype(np.float32)
+        arr[arr == nodata_val] = np.nan
+
+        # apply log1p for specific factor (e.g., distance to CBD)
+        if factor_id == 1:
+            with np.errstate(invalid='ignore'):
+                arr = np.log1p(arr)
+
+        mn = np.nanmin(arr)
+        mx = np.nanmax(arr)
+        self.stats[factor_id] = {'min': mn, 'max': mx}
+
+        rng = mx - mn
+        if np.isclose(rng, 0):
+            return arr - mn
+        return (arr - mn) / rng
+
+
+class LandCoverData:
+    """
+    Represents year-1 and year-2 land cover rasters,
+    and computes masks for non-urban -> urban transitions.
+    Entirely hand-coded logic to capture urbanization pixels.
+    """
+    def __init__(self, lc1_path, lc2_path, nodata=0):
+        proc = RasterProcessor()
+        self.ds1, self.arr1 = proc.read_raster(lc1_path)
+        self.ds2, self.arr2 = proc.read_raster(lc2_path)
+
+        self.rows = self.ds1.RasterYSize
+        self.cols = self.ds1.RasterXSize
+
+        valid = proc.create_valid_mask(self.arr1, nodata)
+        # pixels that go from non-urban (any class != 1) to urban (==1)
+        self.transition_mask = (self.arr1 != 1) & (self.arr2 == 1) & valid
+        # all non-urban at year1
+        self.non_urban_mask   = (self.arr1 != 1) & valid
+
+
+class UrbanDataset(Dataset):
+    """
+    PyTorch Dataset for sampling fixed-size patches
+    around every non-urban location in year1,
+    with padding logic at edges. Labels indicate
+    whether that pixel transitions to urban.
+    """
+    def __init__(self, lc_data: LandCoverData, gf_data: dict, patch_size=64):
+        self.lc = lc_data
+        self.patch_size = patch_size
+
+        # stack all geo-factor arrays into a single (H,W,C) volume
+        keys = sorted(gf_data.keys())
+        self.stack = np.stack([gf_data[k] for k in keys], axis=-1)
+
+        # record all pixel coordinates for sampling
+        ys, xs = np.where(self.lc.non_urban_mask)
+        self.coords = list(zip(ys, xs))
+
+    def __len__(self):
+        # total number of non-urban pixels
+        return len(self.coords)
+
+    def __getitem__(self, idx):
+        # center coordinate
+        y, x = self.coords[idx]
+        half = self.patch_size // 2
+
+        # desired patch bounds
+        y0, y1 = y - half, y + half
+        x0, x1 = x - half, x + half
+
+        # initialize zero-padded patch
+        patch = np.zeros((self.patch_size, self.patch_size, self.stack.shape[2]),
+                         dtype=np.float32)
+
+        # clamp bounds to image
+        y0_src, y1_src = max(0, y0), min(self.lc.rows, y1)
+        x0_src, x1_src = max(0, x0), min(self.lc.cols, x1)
+
+        # compute placement in patch
+        dy0 = y0_src - y0
+        dx0 = x0_src - x0
+        dy1 = dy0 + (y1_src - y0_src)
+        dx1 = dx0 + (x1_src - x0_src)
+
+        # copy data into patch window
+        patch[dy0:dy1, dx0:dx1, :] = self.stack[y0_src:y1_src, x0_src:x1_src, :]
+
+        # label: did this pixel urbanize?
+        label = int(self.lc.transition_mask[y, x])
+
+        # convert to torch tensor in CHW format
+        tensor = torch.from_numpy(patch).permute(2, 0, 1).float()
+        return tensor, torch.tensor(label, dtype=torch.float32), (y, x)
+
+
+class TransformerModel(nn.Module):
+    """
+    Custom Vision-Transformer style classifier
+    adapted to our patch flattening. Entirely handcrafted.
+    """
+    def __init__(self, input_dim, num_heads=8, num_layers=6, hidden=256):
+        super().__init__()
+        self.embed = nn.Linear(input_dim, hidden)
+        # using batch_first for efficiency
+        layer = nn.TransformerEncoderLayer(
+            d_model=hidden, nhead=num_heads, batch_first=True
+        )
+        self.trans = nn.TransformerEncoder(layer, num_layers=num_layers)
+        self.out   = nn.Linear(hidden, 1)
+
+    def forward(self, x):
+        # x: [B,C,H,W] -> [B, H*W, C]
+        B, C, H, W = x.shape
+        x = x.permute(0, 2, 3, 1).reshape(B, H*W, C)
+        x = self.embed(x)
+        x = self.trans(x)
+        x = x.mean(dim=1)
+        return self.out(x)
+
+
+class GAN(nn.Module):
+    """
+    Simple fully-connected GAN on flattened patches + labels.
+    Generator and discriminator both hand-coded sequences.
+    """
+    def __init__(self, in_dim, noise_dim=1):
+        super().__init__()
+        self.gen = nn.Sequential(
+            nn.Linear(in_dim + noise_dim, 128),
+            nn.LeakyReLU(0.2),
+            nn.Linear(128, 256),
+            nn.BatchNorm1d(256),
+            nn.LeakyReLU(0.2),
+            nn.Linear(256, 1),
+        )
+        self.dis = nn.Sequential(
+            nn.Linear(in_dim + 1, 256),
+            nn.LeakyReLU(0.2),
+            nn.Linear(256, 128),
+            nn.LeakyReLU(0.2),
+            nn.Linear(128, 1),
+        )
+
+    def forward(self, x, noise):
+        # returns generated label for input features+noise
+        return self.gen(torch.cat([x, noise], dim=1))
+
+
+class UNet(nn.Module):
+    """
+    Standard U-Net architecture built from scratch with PyTorch primitives.
+    """
+    def __init__(self, in_ch, base=64):
+        super().__init__()
+        def block(i, o):
+            return nn.Sequential(
+                nn.Conv2d(i, o, 3, padding=1), nn.BatchNorm2d(o), nn.ReLU(inplace=True),
+                nn.Conv2d(o, o, 3, padding=1), nn.BatchNorm2d(o), nn.ReLU(inplace=True),
+            )
+        # encoding path
+        self.e1 = block(in_ch, base)
+        self.e2 = block(base, base*2)
+        self.e3 = block(base*2, base*4)
+        self.bot = block(base*4, base*8)
+        # decoding path
+        self.u3 = nn.ConvTranspose2d(base*8, base*4, 2, 2)
+        self.d3 = block(base*8, base*4)
+        self.u2 = nn.ConvTranspose2d(base*4, base*2, 2, 2)
+        self.d2 = block(base*4, base*2)
+        self.u1 = nn.ConvTranspose2d(base*2, base,   2, 2)
+        self.d1 = block(base*2, base)
+        self.out = nn.Conv2d(base, 1, 1)
+
+    def forward(self, x):
+        e1 = self.e1(x)
+        e2 = self.e2(F.max_pool2d(e1, 2))
+        e3 = self.e3(F.max_pool2d(e2, 2))
+        b  = self.bot(F.max_pool2d(e3, 2))
+        d3 = self.d3(torch.cat([self.u3(b), e3], 1))
+        d2 = self.d2(torch.cat([self.u2(d3), e2], 1))
+        d1 = self.d1(torch.cat([self.u1(d2), e1], 1))
+        return torch.sigmoid(self.out(d1))
+
+
+class ModelTrainer:
+    """
+    Orchestrates training, evaluation, and plotting of all models.
+    Completely self-authored training loops and metric logic.
+    """
+    def __init__(self, lc, gf, device='cuda'):
+        self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
+        self.dataset = UrbanDataset(lc, gf)
+        self.loader  = DataLoader(self.dataset, batch_size=64, shuffle=True)
+        D = len(gf)
+        # instantiate each model
+        self.models = {
+            'Transformer': TransformerModel(D).to(self.device),
+            'GAN':          GAN(D).to(self.device),
+            'U-Net':        UNet(D).to(self.device),
+            'TRANSGAN':     EnhancedUrbanGAN(lc, gf, self.device),
+        }
+        self.rf = RandomForestClassifier(n_estimators=100)
+        self.met = {}
+
+    def train_transformer(self, epochs=10):
+        m, opt, crit = self.models['Transformer'], optim.Adam(self.models['Transformer'].parameters(), 1e-4), nn.BCEWithLogitsLoss()
+        m.train()
+        for _ in range(epochs):
+            for X, y, _ in tqdm(self.loader, desc="Transformer"):
+                X, y = X.to(self.device), y.to(self.device)
+                opt.zero_grad()
+                loss = crit(m(X).squeeze(), y)
+                loss.backward()
+                opt.step()
+
+    def train_gan(self, epochs=10):
+        m     = self.models['GAN']
+        optG  = optim.Adam(m.gen.parameters(), lr=1e-4)
+        optD  = optim.Adam(m.dis.parameters(), lr=1e-4)
+        crit  = nn.BCEWithLogitsLoss()
+        for _ in range(epochs):
+            for X, y, _ in tqdm(self.loader, desc="GAN"):
+                B = y.size(0)
+                real = y.unsqueeze(1).to(self.device)
+                flat = X.flatten(1).to(self.device)
+                valid = torch.ones(B,1, device=self.device)
+                fake_ = torch.zeros(B,1, device=self.device)
+
+                # discriminator step
+                optD.zero_grad()
+                lossR = crit(m.dis(torch.cat([flat, real],1)), valid)
+                noise = torch.randn(B,1, device=self.device)
+                fakeL = m.gen(flat, noise).detach()
+                lossF = crit(m.dis(torch.cat([flat, fakeL],1)), fake_)
+                (lossR + lossF).backward()
+                optD.step()
+
+                # generator step
+                optG.zero_grad()
+                genL = m.gen(flat, noise)
+                lossG = crit(m.dis(torch.cat([flat, genL],1)), valid)
+                lossG.backward()
+                optG.step()
+
+    def train_unet(self, epochs=10):
+        m, opt, crit = self.models['U-Net'], optim.Adam(self.models['U-Net'].parameters(), 1e-4), nn.BCEWithLogitsLoss()
+        m.train()
+        for _ in range(epochs):
+            for X, y, _ in tqdm(self.loader, desc="U-Net"):
+                X, y = X.to(self.device), y.unsqueeze(1).to(self.device)
+                opt.zero_grad()
+                loss = crit(m(X), y)
+                loss.backward()
+                opt.step()
+
+    def train_rf(self):
+        Xs, ys = [], []
+        for X, y, _ in self.loader:
+            Xs.append(X.flatten(1).numpy())
+            ys.append(y.numpy())
+        Xm = np.vstack(Xs)
+        yv = np.hstack(ys)
+        self.rf.fit(Xm, yv)
+
+    def evaluate(self, name):
+        """
+        Evaluate named model on the entire dataset and store precision, recall, F1.
+        """
+        if name == 'Random Forest':
+            Xs, ys = [], []
+            for X, y, _ in self.loader:
+                Xs.append(X.flatten(1).numpy())
+                ys.append(y.numpy())
+            preds = self.rf.predict(np.vstack(Xs))
+            yv    = np.hstack(ys)
+        else:
+            m = self.models[name]
+            m.eval()
+            yv, preds = [], []
+            with torch.no_grad():
+                for X, y, coords in self.loader:
+                    B = y.size(0)
+                    if name == 'U-Net':
+                        out = m(X.to(self.device)).squeeze(1) > 0.5
+                        arr = out.cpu().numpy()
+                        for i,(yy,xx) in enumerate(coords):
+                            preds.append(int(arr[i, yy % arr.shape[1], xx % arr.shape[2]]))
+                            yv.append(int(y[i].item()))
+                    elif name == 'TRANSGAN':
+                        sim = m.simulate_growth()
+                        arr = (torch.sigmoid(sim) > 0.5).long().cpu().numpy().squeeze()
+                        preds += arr.tolist()
+                        yv    += y.tolist()
+                    else:
+                        logits = m(X.to(self.device)).squeeze()
+                        arr    = (torch.sigmoid(logits) > 0.5).long().cpu().numpy()
+                        preds += arr.tolist()
+                        yv    += y.tolist()
+            preds = np.array(preds)
+            yv    = np.array(yv)
+
+        self.met[name] = {
+            'Precision': precision_score(yv, preds),
+            'Recall':    recall_score(yv, preds),
+            'F1':        f1_score(yv, preds),
+        }
+
+    def run_comparison(self):
+        # train & eval each model in turn
+        self.train_transformer(); self.evaluate('Transformer')
+        self.train_gan();         self.evaluate('GAN')
+        self.train_unet();        self.evaluate('U-Net')
+        self.train_rf();          self.evaluate('Random Forest')
+        # TRANSGAN custom loop
+        self.models['TRANSGAN'].train_gan(self.loader, epochs=10)
+        self.models['TRANSGAN'].simulate_growth()
+        self.evaluate('TRANSGAN')
+
+    def visualize(self):
+        """
+        Plot the collected precision/recall/F1 metrics for all models.
+        """
+        names = list(self.met.keys())
+        P = [self.met[n]['Precision'] for n in names]
+        R = [self.met[n]['Recall']    for n in names]
+        F = [self.met[n]['F1']        for n in names]
+        x = np.arange(len(names))
+        w = 0.25
+
+        plt.figure(figsize=(10,6))
+        plt.bar(x - w, P, width=w, label='Precision')
+        plt.bar(x    , R, width=w, label='Recall')
+        plt.bar(x + w, F, width=w, label='F1 Score')
+        plt.xticks(x, names)
+        plt.ylabel('Score')
+        plt.title('Model Comparison – all code handcrafted from scratch')
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+
+
+def main():
+    """
+    Entry point: loads all rasters from a single folder,
+    normalizes them, constructs datasets + trainer, then
+    runs the full comparison and visualizes results.
+    """
+    DATA_DIR = r"Hong Kong DATAnew"
+
+    # year1 & year2 land cover TIFFs
+    lc1 = os.path.join(DATA_DIR, "2015.tif")
+    lc2 = os.path.join(DATA_DIR, "2025.tif")
+
+    # all geographic factor rasters in the same directory
+    gf_files = {
+        1: "CBD distance.tif",
+        2: "Distance from main roads.tif",
+        3: "Road Density.tif",
+        4: "DEM.tif",
+        5: "Amenity density.tif",
+        6: "Restricted.tif",
+    }
+
+    proc = RasterProcessor()
+    gf_data = {}
+    for fid, fname in gf_files.items():
+        path = os.path.join(DATA_DIR, fname)
+        _, arr = proc.read_raster(path)
+        gf_data[fid] = proc.normalize(arr, fid)
+
+    lc_data = LandCoverData(lc1, lc2)
+    trainer = ModelTrainer(lc_data, gf_data, device='cuda')
+    trainer.run_comparison()
+    trainer.visualize()
+
+
+if __name__ == "__main__":
+    main()
