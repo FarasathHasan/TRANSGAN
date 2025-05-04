@@ -1,0 +1,584 @@
+import os
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from torch.amp import GradScaler, autocast
+from osgeo import gdal
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+from sklearn.metrics import jaccard_score, f1_score, cohen_kappa_score, precision_score, recall_score
+import torch.nn.functional as F
+import shap
+from shap import KernelExplainer
+import pandas as pd
+
+
+# ----------------------------
+# Enhanced Data Processing
+# ----------------------------
+
+class RasterProcessor:
+    def __init__(self):
+        self.stats = {}
+        self.valid_mask = None
+
+    def read_raster(self, path):
+        """Read raster and return dataset and array with proper masking"""
+        ds = gdal.Open(path)
+        if ds is None:
+            raise ValueError(f"Could not open raster: {path}")
+        band = ds.GetRasterBand(1)
+        array = band.ReadAsArray()
+        return ds, array
+
+    def create_valid_mask(self, lc_array):
+        """Create mask of valid study area (non-zero values)"""
+        self.valid_mask = (lc_array != 0)
+        return self.valid_mask
+
+    def normalize(self, array, factor_id):
+        """Normalize array with factor-specific statistics.
+           For CBD DISTANCE (factor_id == 1), a logarithmic transform is applied
+           to expand the dynamic range before normalization.
+        """
+        array = array.astype(np.float32)
+        mask = (array == -9999)  # Common nodata value
+        array[mask] = np.nan
+
+        if factor_id == 1:
+            array = np.log1p(array)
+
+        arr_min = np.nanmin(array)
+        arr_max = np.nanmax(array)
+        self.stats[factor_id] = {'min': arr_min, 'max': arr_max}
+        range_val = arr_max - arr_min
+        if np.isclose(range_val, 0):
+            normalized = array - arr_min
+            normalized[mask] = 0
+            return normalized
+
+        normalized = (array - arr_min) / range_val
+        normalized[mask] = 0
+        return normalized
+
+
+class LandCoverData:
+    def __init__(self, lc1_path, lc2_path):
+        self.processor = RasterProcessor()
+        self.ds_lc1, self.arr_lc1 = self.processor.read_raster(lc1_path)
+        self.ds_lc2, self.arr_lc2 = self.processor.read_raster(lc2_path)
+        self._validate_rasters()
+        self._prepare_masks()
+
+    def _validate_rasters(self):
+        if (self.ds_lc1.RasterXSize != self.ds_lc2.RasterXSize or
+                self.ds_lc1.RasterYSize != self.ds_lc2.RasterYSize):
+            raise ValueError("Land cover rasters have different dimensions")
+        self.rows = self.ds_lc1.RasterYSize
+        self.cols = self.ds_lc1.RasterXSize
+        self.processor.create_valid_mask(self.arr_lc1)
+
+    def _prepare_masks(self):
+        """Create masks considering valid study area and class transitions"""
+        valid_mask = self.processor.valid_mask
+        self.transition_mask = (self.arr_lc1 != 1) & (self.arr_lc2 == 1) & valid_mask
+        self.non_urban_mask = (self.arr_lc1 != 1) & valid_mask
+        self.urban_mask = (self.arr_lc1 == 1) & valid_mask
+
+
+# ----------------------------
+# Advanced Model Components
+# ----------------------------
+
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=5000):
+        super().__init__()
+        self.d_model = d_model
+        self.max_len = max_len
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2, dtype=torch.float) * (-np.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe.unsqueeze(0))  # shape (1, max_len, d_model)
+
+    def forward(self, x):
+        seq_len = x.size(1)
+        if seq_len <= self.max_len:
+            return x + self.pe[:, :seq_len]
+        else:
+            device = x.device
+            position = torch.arange(0, seq_len, dtype=torch.float, device=device).unsqueeze(1)
+            div_term = torch.exp(torch.arange(0, self.d_model, 2, dtype=torch.float, device=device) *
+                                 (-np.log(10000.0) / self.d_model))
+            pe = torch.zeros(seq_len, self.d_model, device=device)
+            pe[:, 0::2] = torch.sin(position * div_term)
+            pe[:, 1::2] = torch.cos(position * div_term)
+            pe = pe.unsqueeze(0)
+            return x + pe
+
+
+class ConvAttentionBlock(nn.Module):
+    def __init__(self, embed_dim, num_heads=8, conv_kernel=3):
+        super().__init__()
+        self.conv = nn.Conv1d(embed_dim, embed_dim, conv_kernel, padding=conv_kernel // 2)
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.attention = nn.MultiheadAttention(embed_dim, num_heads)
+        self.norm2 = nn.LayerNorm(embed_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim * 4),
+            nn.GELU(),
+            nn.Linear(embed_dim * 4, embed_dim)
+        )
+
+    def forward(self, x):
+        conv_out = self.conv(x.permute(1, 2, 0)).permute(2, 0, 1)
+        x = self.norm1(x + conv_out)
+        attn_out, _ = self.attention(x, x, x)
+        x = self.norm2(x + attn_out)
+        return x + self.ffn(x)
+
+
+class SocialPooling(nn.Module):
+    def __init__(self, input_dim, pool_size=3):
+        super().__init__()
+        self.pool = nn.MaxPool2d(pool_size, stride=1, padding=pool_size // 2)
+        self.proj = nn.Sequential(
+            nn.Linear(input_dim * 2, input_dim),
+            nn.GELU()
+        )
+
+    def forward(self, x, spatial_dims):
+        batch_size = x.size(1)
+        seq_len = x.size(0)
+        features = x.size(2)
+        h, w = spatial_dims
+        if h * w != seq_len:
+            raise ValueError(f"Provided spatial_dims {spatial_dims} do not match sequence length {seq_len}")
+        x_2d = x.transpose(0, 1).contiguous().view(batch_size, h, w, features).permute(0, 3, 1, 2)
+        pooled = self.pool(x_2d)
+        pooled = pooled.permute(0, 2, 3, 1).view(batch_size, -1, features).transpose(0, 1)
+        combined = torch.cat([x, pooled], dim=-1)
+        return self.proj(combined)
+
+
+class ResidualTransformerBlock(nn.Module):
+    def __init__(self, dim, num_heads=8, dropout=0.1):
+        super().__init__()
+        self.attention = nn.MultiheadAttention(dim, num_heads, dropout=dropout)
+        self.norm1 = nn.LayerNorm(dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, dim * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim * 4, dim),
+            nn.Dropout(dropout)
+        )
+        self.norm2 = nn.LayerNorm(dim)
+
+    def forward(self, x):
+        attn_output, _ = self.attention(x, x, x)
+        x = self.norm1(x + attn_output)
+        mlp_output = self.mlp(x)
+        x = self.norm2(x + mlp_output)
+        return x
+
+
+# ----------------------------
+# Enhanced GAN Architecture
+# ----------------------------
+
+class UrbanGenerator(nn.Module):
+    def __init__(self, input_dim, latent_dim=128):
+        super().__init__()
+        self.input_proj = nn.Sequential(
+            nn.Linear(input_dim + 1, latent_dim),
+            nn.GELU()
+        )
+        self.pos_encoder = PositionalEncoding(latent_dim)
+        self.conv_attn1 = ConvAttentionBlock(latent_dim)
+        self.residual_transformer = ResidualTransformerBlock(latent_dim)
+        self.social_pool = SocialPooling(latent_dim)
+        self.conv_attn2 = ConvAttentionBlock(latent_dim)
+        self.output_layer = nn.Sequential(
+            nn.Linear(latent_dim, 64),
+            nn.GELU(),
+            nn.Linear(64, 1)
+        )
+
+    def forward(self, x, noise, spatial_dims=None):
+        x = torch.cat([x, noise], dim=1)
+        x = self.input_proj(x)
+        x = x.unsqueeze(0)
+        x = self.pos_encoder(x)
+        x = x.transpose(0, 1)
+        x = self.conv_attn1(x)
+        x = self.residual_transformer(x)
+        if spatial_dims is None:
+            spatial_dims = (x.size(0), 1)
+        x = self.social_pool(x, spatial_dims)
+        x = self.conv_attn2(x)
+        x = x.transpose(0, 1)
+        x = self.output_layer(x)
+        x = x.squeeze(0)
+        return x
+
+
+class UrbanDiscriminator(nn.Module):
+    def __init__(self, input_dim, latent_dim=128):
+        super().__init__()
+        self.fc = nn.Linear(input_dim + 1, latent_dim)
+        self.pos_encoder = PositionalEncoding(latent_dim)
+        self.conv_attn = ConvAttentionBlock(latent_dim)
+        self.social_pool = SocialPooling(latent_dim)
+        self.fc_out = nn.Linear(latent_dim, 1)
+
+    def forward(self, x, labels, spatial_dims=None):
+        x = torch.cat([x, labels], dim=1)
+        x = self.fc(x)
+        x = x.unsqueeze(0)
+        x = self.pos_encoder(x)
+        x = x.transpose(0, 1)
+        x = self.conv_attn(x)
+        if spatial_dims is None:
+            spatial_dims = (x.size(0), 1)
+        x = self.social_pool(x, spatial_dims)
+        x = x.squeeze(1)
+        x = self.fc_out(x)
+        return x
+
+
+# ----------------------------
+# Enhanced Evaluation System
+# ----------------------------
+
+class UrbanMetrics:
+    @staticmethod
+    def calculate_metrics(y_true, y_pred):
+        y_true_bin = (y_true == 1).astype(int)
+        y_pred_bin = (y_pred == 1).astype(int)
+        return {
+            'IoU': jaccard_score(y_true_bin, y_pred_bin),
+            'F1': f1_score(y_true_bin, y_pred_bin),
+            'Kappa': cohen_kappa_score(y_true_bin, y_pred_bin),
+            'Precision': precision_score(y_true_bin, y_pred_bin),
+            'Recall': recall_score(y_true_bin, y_pred_bin)
+        }
+
+
+# ----------------------------
+# Complete GAN System
+# ----------------------------
+
+class EnhancedUrbanGAN:
+    def __init__(self, lc_data, gf_data, device='cuda'):
+        self.device = device
+        self.lc = lc_data
+        self.gf = gf_data
+        self.input_dim = len(gf_data)
+        # Updated variable names with consistent naming.
+        self.variable_names = ["CBD_cleaned", "road", "roaddens", "slope", "amenitydense", "restricted"]
+        self._initialize_models()
+        self._setup_optimizers()
+        self._create_neighborhood_kernel()
+        self.scaler = GradScaler()
+        self.conversion_threshold = 0.1
+        self.pressure_decay = 0.5
+        self.neighborhood_weight = 0.9
+        self.restricted_id = 6
+
+    def _initialize_models(self):
+        self.generator = UrbanGenerator(self.input_dim).to(self.device)
+        self.discriminator = UrbanDiscriminator(self.input_dim).to(self.device)
+
+    def _setup_optimizers(self):
+        self.opt_g = optim.AdamW(self.generator.parameters(), lr=1e-4, weight_decay=1e-5)
+        self.opt_d = optim.AdamW(self.discriminator.parameters(), lr=1e-4, weight_decay=1e-5)
+
+    def _create_neighborhood_kernel(self):
+        self.neighborhood_kernel = nn.Conv2d(1, 1, 5, padding=2, bias=False)
+        nn.init.normal_(self.neighborhood_kernel.weight, mean=0.5, std=0.1)
+        self.neighborhood_kernel.to(self.device)
+
+    def _calculate_neighborhood(self, urban_map):
+        urban_tensor = torch.tensor(urban_map, device=self.device).float().unsqueeze(0).unsqueeze(0)
+        neighborhood = self.neighborhood_kernel(urban_tensor)
+        neighborhood *= torch.tensor(self.lc.processor.valid_mask, device=self.device).float()
+        return neighborhood.detach().squeeze().cpu().numpy()
+
+    def train_gan(self, dataset, epochs=100, batch_size=512):
+        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True,
+                                pin_memory=True, num_workers=4)
+        for epoch in range(epochs):
+            self.generator.train()
+            self.discriminator.train()
+            progress = tqdm(dataloader, desc=f"Epoch {epoch + 1}/{epochs}")
+            for features, labels in progress:
+                features = features.to(self.device, non_blocking=True)
+                labels = labels.to(self.device, non_blocking=True).float()
+                with autocast(device_type=self.device):
+                    real_pred = self.discriminator(features, labels.unsqueeze(1))
+                    real_loss = nn.functional.binary_cross_entropy_with_logits(real_pred, torch.ones_like(real_pred))
+                    noise = torch.randn(features.size(0), 1, device=self.device)
+                    fake_labels = self.generator(features, noise)
+                    fake_pred = self.discriminator(features, fake_labels.detach())
+                    fake_loss = nn.functional.binary_cross_entropy_with_logits(fake_pred, torch.zeros_like(fake_pred))
+                    d_loss = (real_loss + fake_loss) / 2
+                self.opt_d.zero_grad()
+                self.scaler.scale(d_loss).backward()
+                self.scaler.step(self.opt_d)
+                with autocast(device_type=self.device):
+                    fake_labels = self.generator(features, noise)
+                    fake_pred = self.discriminator(features, fake_labels)
+                    g_loss = nn.functional.binary_cross_entropy_with_logits(fake_pred, torch.ones_like(fake_pred))
+                self.opt_g.zero_grad()
+                self.scaler.scale(g_loss).backward()
+                self.scaler.step(self.opt_g)
+                self.scaler.update()
+                progress.set_postfix({'D Loss': d_loss.item(), 'G Loss': g_loss.item()})
+
+    def simulate_growth(self, n_iterations=5, patch_size=64):
+        current_landuse = self.lc.arr_lc1.copy().astype(np.int32)
+        valid_mask = self.lc.processor.valid_mask
+        current_landuse[~valid_mask] = 0
+        initial_urban = np.sum((current_landuse == 1) & valid_mask)
+        target_urban = np.sum(self.lc.arr_lc2 == 1)
+        needed_conversion = max(target_urban - initial_urban, 0)
+        if needed_conversion == 0:
+            self.prediction = current_landuse
+            return
+        conversion_per_iter = max(needed_conversion // n_iterations, 1)
+        development_pressure = 1.0
+        rows, cols = self.lc.rows, self.lc.cols
+        features = np.stack([self.gf[k] for k in sorted(self.gf.keys())], axis=-1)
+        for _ in range(n_iterations):
+            urban_mask = (current_landuse == 1) & valid_mask
+            neighborhood = self._calculate_neighborhood(urban_mask.astype(float))
+            proba_full = np.zeros((rows, cols))
+            for i in range(0, rows, patch_size):
+                for j in range(0, cols, patch_size):
+                    patch_h = min(patch_size, rows - i)
+                    patch_w = min(patch_size, cols - j)
+                    patch_features = features[i:i + patch_h, j:j + patch_w, :]
+                    patch_tensor = torch.tensor(patch_features, device=self.device).float().view(-1, self.input_dim)
+                    with torch.no_grad():
+                        noise = torch.randn(patch_tensor.size(0), 1, device=self.device)
+                        logits = self.generator(patch_tensor, noise, spatial_dims=(patch_h, patch_w))
+                        patch_proba = torch.sigmoid(logits).cpu().numpy().reshape((patch_h, patch_w))
+                    proba_full[i:i + patch_h, j:j + patch_w] = patch_proba
+            restricted_mask = self.gf[self.restricted_id] >= 0.99
+            proba_full[restricted_mask] = 0
+            proba_full[~valid_mask] = 0
+            combined_proba = proba_full * (1 + self.neighborhood_weight * neighborhood) * development_pressure
+            candidate_mask = (current_landuse != 1) & valid_mask & ~restricted_mask
+            candidate_probs = combined_proba[candidate_mask]
+            if candidate_probs.size == 0:
+                break
+            sorted_idx = np.argsort(candidate_probs)[::-1]
+            threshold_idx = min(conversion_per_iter, len(sorted_idx)) - 1
+            threshold = candidate_probs[sorted_idx[threshold_idx]]
+            convert_mask = candidate_mask & (combined_proba >= threshold)
+            current_landuse[convert_mask] = 1
+            development_pressure *= self.pressure_decay
+        self.prediction = current_landuse
+
+    def evaluate(self):
+        y_true = self.lc.arr_lc2[self.lc.non_urban_mask].flatten()
+        y_pred = self.prediction[self.lc.non_urban_mask].flatten()
+        metrics = UrbanMetrics.calculate_metrics(y_true, y_pred)
+        print("Evaluation Metrics:")
+        for name, value in metrics.items():
+            print(f"{name}: {value:.4f}")
+
+    def visualize(self):
+        fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+        titles = ['Initial Land Use', 'Actual Future', 'Predicted Future']
+        data = [self.lc.arr_lc1, self.lc.arr_lc2, self.prediction]
+        for ax, title, arr in zip(axes, titles, data):
+            masked = np.ma.masked_where(arr == 0, arr)
+            im = ax.imshow(masked, cmap='viridis', vmin=1, vmax=4)
+            ax.set_title(title)
+            ax.axis('off')
+        fig.colorbar(im, ax=axes, orientation='horizontal', fraction=0.02, pad=0.04)
+        plt.show()
+
+    # ------------------------------------------
+    # Interpretation Components (SHAP & Attention)
+    # ------------------------------------------
+    def interpret_model(self, dataset, num_samples=100):
+        self.generator.eval()
+
+        def generator_wrapper(x):
+            outputs = []
+            num_noise_samples = 10  # Average over 10 noise samples for each input
+            for i in range(x.shape[0]):
+                sample = torch.tensor(x[i:i + 1], device=self.device, dtype=torch.float32)
+                pred_sum = 0
+                for _ in range(num_noise_samples):
+                    noise = torch.randn(1, 1, device=self.device)
+                    with torch.no_grad():
+                        out = self.generator(sample, noise, spatial_dims=(1, 1))
+                        out = torch.sigmoid(out)
+                    pred_sum += out.cpu().numpy()
+                outputs.append(pred_sum / num_noise_samples)
+            return np.array(outputs).reshape(-1, 1)
+
+        sample_data = []
+        sample_labels = []
+        for features, labels in DataLoader(dataset, batch_size=num_samples, shuffle=True):
+            sample_data.append(features.numpy())
+            sample_labels.append(labels.numpy())
+        sample_data = np.concatenate(sample_data)[:num_samples]
+        sample_labels = np.concatenate(sample_labels)[:num_samples]
+
+        if sample_data.ndim == 3:
+            sample_data = sample_data.reshape(sample_data.shape[0], sample_data.shape[1])
+
+        df_sample = pd.DataFrame(sample_data, columns=self.variable_names)
+        background = df_sample.iloc[:20]
+        explainer = KernelExplainer(model=generator_wrapper, data=background)
+        test_samples = df_sample.iloc[20:40]
+        shap_values = explainer.shap_values(X=test_samples, nsamples=50, l1_reg="num_features(10)")
+        # Filter out the "restricted_cleaned" column (assumed to be the last column) for visualization.
+        shap_values_filtered = shap_values[0][:, :-1]
+        test_samples_filtered = test_samples.drop(columns=['restricted'])
+        shap.summary_plot(
+            shap_values_filtered,
+            features=test_samples_filtered,
+            feature_names=test_samples_filtered.columns,
+            plot_type="bar",
+            show=True,
+            title="Feature Importance Based on SHAP Values"
+        )
+        plt.show()
+        return {
+            'shap_values': shap_values,
+            'test_samples': test_samples,
+            'background': background
+        }
+
+    def visualize_attention(self, sample_features):
+        attn_weights = {}
+
+        def hook_fn(module, input, output):
+            attn_weights['weights'] = output[1].detach().cpu().numpy()
+
+        hook_handle = self.generator.conv_attn1.attention.register_forward_hook(hook_fn)
+        try:
+            self.generator.eval()
+            sample = sample_features.to(self.device, dtype=torch.float32)
+            noise = torch.zeros(sample.shape[0], 1, device=self.device)
+            with torch.no_grad():
+                _ = self.generator(sample, noise, spatial_dims=(sample.shape[0], 1))
+            weights = attn_weights.get('weights', None)
+            if weights is not None:
+                attn_matrix = weights[0]  # shape (L, L)
+                plt.figure(figsize=(10, 8))
+                plt.imshow(attn_matrix, cmap='viridis', aspect='auto')
+                plt.colorbar()
+                plt.title("Attention Weights for First Sample")
+                plt.xlabel("Token Position")
+                plt.ylabel("Token Position")
+                plt.show()
+                return attn_matrix
+            else:
+                return None
+        finally:
+            hook_handle.remove()
+
+
+# ----------------------------
+# Dataset and Utilities
+# ----------------------------
+
+class UrbanDataset(Dataset):
+    def __init__(self, lc_data, gf_data):
+        self.samples = []
+        valid_mask = lc_data.processor.valid_mask
+        non_urban_mask = lc_data.non_urban_mask
+        sorted_keys = sorted(gf_data.keys())
+        for y in range(lc_data.rows):
+            for x in range(lc_data.cols):
+                if non_urban_mask[y, x]:
+                    features = [gf_data[k][y, x] for k in sorted_keys]
+                    label = int(lc_data.transition_mask[y, x])
+                    self.samples.append((features, label))
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        features, label = self.samples[idx]
+        return torch.tensor(features, dtype=torch.float32), torch.tensor(label, dtype=torch.float32)
+
+
+def save_prediction(array, filename, prototype):
+    directory = os.path.dirname(filename)
+    if not os.path.exists(directory):
+        os.makedirs(directory)
+    driver = gdal.GetDriverByName("GTiff")
+    ds = driver.Create(filename, prototype.RasterXSize, prototype.RasterYSize, 1, gdal.GDT_Int16)
+    if ds is None:
+        raise RuntimeError(f"Failed to create file {filename}")
+    ds.SetGeoTransform(prototype.GetGeoTransform())
+    ds.SetProjection(prototype.GetProjection())
+    band = ds.GetRasterBand(1)
+    band.WriteArray(array)
+    band.SetNoDataValue(0)
+    ds = None
+
+
+# ----------------------------
+# Execution Pipeline
+# ----------------------------
+
+if __name__ == "__main__":
+    # Load land cover data
+    lc = LandCoverData("Hong Kong DATA/2015cleaned.tif", "Hong Kong DATA/2025cleaned.tif")
+
+    gf_paths = {
+        1: "Hong Kong DATAnew/CBD distance.tif",
+        2: "Hong Kong DATAnew/Distance from main roads.tif",
+        3: "Hong Kong DATAnew/Road Density.tif",
+        4: "Hong Kong DATAnew/DEM.tif",
+        5: "Hong Kong DATAnew/Amenity density.tif",
+        6: "Hong Kong DATAnew/Restricted.tif"
+    }
+
+    processor = RasterProcessor()
+    gf_data = {}
+    for fid, path in gf_paths.items():
+        _, arr = processor.read_raster(path)
+        gf_data[fid] = processor.normalize(arr, fid)
+
+    dataset = UrbanDataset(lc, gf_data)
+    model = EnhancedUrbanGAN(lc, gf_data)
+    model.train_gan(dataset, epochs=1)
+    model.simulate_growth(n_iterations=8, patch_size=64)
+    model.evaluate()
+    model.visualize()
+    print("\nStarting Model Interpretation...")
+    print("Running SHAP analysis...")
+    shap_results = model.interpret_model(dataset, num_samples=100)
+    print("Visualizing attention weights...")
+    sample_features, _ = next(iter(DataLoader(dataset, batch_size=64, shuffle=True)))
+    attention_weights = model.visualize_attention(sample_features)
+    print("Calculating feature importance...")
+    shap_vals = np.abs(shap_results['shap_values'][0])
+    shap_vals_filtered = shap_vals[:, :-1]
+    feature_importance = pd.DataFrame({
+        'Feature': model.variable_names[:-1],
+        'Importance': shap_vals_filtered.mean(0)
+    }).sort_values('Importance', ascending=False)
+    print("\nTop Influential Factors:")
+    print(feature_importance.head(10))
+    plt.figure(figsize=(10, 6))
+    plt.barh(feature_importance['Feature'][:10], feature_importance['Importance'][:10])
+    plt.gca().invert_yaxis()
+    plt.title("Top 10 Influential Urban Growth Factors")
+    plt.xlabel("Mean Absolute SHAP Value")
+    plt.tight_layout()
+    plt.show()
+    save_prediction(model.prediction, "C:/Users/faras/Desktop/datanew12", lc.ds_lc1)
